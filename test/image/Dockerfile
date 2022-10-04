@@ -6,4 +6,5 @@ RUN cargo build --target=wasm32-wasi --release
 
 FROM scratch
 ENTRYPOINT ["/wasm"]
+STOPSIGNAL SIGKILL
 COPY --from=build /opt/wasmtest/target/wasm32-wasi/release/containerd-shim-wasmtime-demo.wasm /wasm
