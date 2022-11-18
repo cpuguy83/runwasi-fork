@@ -1,32 +1,33 @@
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use containerd_shim_wasm::sandbox::error::Error;
+use containerd_shim_wasm::sandbox::exec;
 use containerd_shim_wasm::sandbox::oci;
 use containerd_shim_wasm::sandbox::{EngineGetter, Instance, InstanceConfig};
 use log::{debug, error};
-use wasmtime::{Config as EngineConfig, Engine, Linker, Module, Store};
+use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::{sync::file::File as WasiFile, WasiCtx, WasiCtxBuilder};
 
 use super::error::WasmtimeError;
 use super::oci_wasmtime;
 
+type ExitCode = (Mutex<Option<(u32, DateTime<Utc>)>>, Condvar);
 pub struct Wasi {
-    interupt: Arc<RwLock<Option<wasmtime::InterruptHandle>>>,
-    exit_code: Arc<(Mutex<Option<(u32, DateTime<Utc>)>>, Condvar)>,
+    exit_code: Arc<ExitCode>,
     engine: wasmtime::Engine,
 
-    id: String,
     stdin: String,
     stdout: String,
     stderr: String,
     bundle: String,
+
+    pidfd: Arc<Mutex<Option<exec::PidFD>>>,
 }
 
 #[cfg(test)]
@@ -72,21 +73,20 @@ pub fn maybe_open_stdio(path: &str) -> Result<Option<WasiFile>, Error> {
     }
 }
 
+fn load_spec(bundle: String) -> Result<oci::Spec, Error> {
+    let mut spec = oci::load(Path::new(&bundle).join("config.json").to_str().unwrap())?;
+    spec.canonicalize_rootfs(&bundle)
+        .map_err(|e| Error::Others(format!("error canonicalizing rootfs in spec: {}", e)))?;
+    Ok(spec)
+}
+
 pub fn prepare_module(
     engine: wasmtime::Engine,
-    bundle: String,
+    spec: &oci::Spec,
     stdin_path: String,
     stdout_path: String,
     stderr_path: String,
 ) -> Result<(WasiCtx, Module), WasmtimeError> {
-    let mut spec = oci::load(Path::new(&bundle).join("config.json").to_str().unwrap())?;
-
-    spec.canonicalize_rootfs(&bundle).map_err(|err| {
-        WasmtimeError::Error(Error::Others(format!(
-            "could not canonicalize rootfs: {}",
-            err
-        )))
-    })?;
     debug!("opening rootfs");
     let rootfs = oci_wasmtime::get_rootfs(&spec)?;
     let args = oci::get_args(&spec);
@@ -100,20 +100,20 @@ pub fn prepare_module(
 
     debug!("opening stdin");
     let stdin = maybe_open_stdio(&stdin_path).context("could not open stdin")?;
-    if stdin.is_some() {
-        wasi_builder = wasi_builder.stdin(Box::new(stdin.unwrap()));
+    if let Some(sin) = stdin {
+        wasi_builder = wasi_builder.stdin(Box::new(sin));
     }
 
     debug!("opening stdout");
     let stdout = maybe_open_stdio(&stdout_path).context("could not open stdout")?;
-    if stdout.is_some() {
-        wasi_builder = wasi_builder.stdout(Box::new(stdout.unwrap()));
+    if let Some(sout) = stdout {
+        wasi_builder = wasi_builder.stdout(Box::new(sout));
     }
 
     debug!("opening stderr");
     let stderr = maybe_open_stdio(&stderr_path).context("could not open stderr")?;
-    if stderr.is_some() {
-        wasi_builder = wasi_builder.stderr(Box::new(stderr.unwrap()));
+    if let Some(serr) = stderr {
+        wasi_builder = wasi_builder.stderr(Box::new(serr));
     }
 
     debug!("building wasi context");
@@ -122,8 +122,8 @@ pub fn prepare_module(
 
     let mut cmd = args[0].clone();
     let stripped = args[0].strip_prefix(std::path::MAIN_SEPARATOR);
-    if stripped.is_some() {
-        cmd = stripped.unwrap().to_string();
+    if let Some(strpd) = stripped {
+        cmd = strpd.to_string();
     }
 
     let mod_path = oci::get_root(&spec).join(cmd);
@@ -137,137 +137,96 @@ pub fn prepare_module(
 
 impl Instance for Wasi {
     type E = wasmtime::Engine;
-    fn new(id: String, cfg: Option<&InstanceConfig<Self::E>>) -> Self {
+    fn new(_id: String, cfg: Option<&InstanceConfig<Self::E>>) -> Self {
         let cfg = cfg.unwrap(); // TODO: handle error
         Wasi {
-            interupt: Arc::new(RwLock::new(None)),
             exit_code: Arc::new((Mutex::new(None), Condvar::new())),
             engine: cfg.get_engine(),
-            id,
             stdin: cfg.get_stdin().unwrap_or_default(),
             stdout: cfg.get_stdout().unwrap_or_default(),
             stderr: cfg.get_stderr().unwrap_or_default(),
             bundle: cfg.get_bundle().unwrap_or_default(),
+            pidfd: Arc::new(Mutex::new(None)),
         }
     }
     fn start(&self) -> Result<u32, Error> {
         let engine = self.engine.clone();
-
-        let exit_code = self.exit_code.clone();
-        let interupt = self.interupt.clone();
-        let (tx, rx) = channel::<Result<(), Error>>();
-        let bundle = self.bundle.clone();
         let stdin = self.stdin.clone();
         let stdout = self.stdout.clone();
         let stderr = self.stderr.clone();
 
-        let _ =
-            thread::Builder::new()
-                .name(self.id.clone())
-                .spawn(move || {
-                    debug!("starting instance");
-                    let mut linker = Linker::new(&engine);
+        debug!("starting instance");
+        let mut linker = Linker::new(&engine);
 
-                    match wasmtime_wasi::add_to_linker(&mut linker, |s| s)
-                        .map_err(|err| Error::Others(format!("error adding to linker: {}", err)))
-                    {
-                        Ok(_) => (),
-                        Err(err) => {
-                            tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
+        wasmtime_wasi::add_to_linker(&mut linker, |s| s)
+            .map_err(|err| Error::Others(format!("error adding to linker: {}", err)))?;
 
-                    debug!("preparing module");
-                    let m = match prepare_module(engine.clone(), bundle, stdin, stdout, stderr) {
-                        Ok(f) => f,
-                        Err(err) => {
-                            tx.send(Err(Error::Others(err.to_string()))).unwrap();
-                            return;
-                        }
-                    };
+        debug!("preparing module");
+        let spec = load_spec(self.bundle.clone())?;
+        let m = prepare_module(engine.clone(), &spec, stdin, stdout, stderr)
+            .map_err(|e| Error::Others(format!("error setting up module: {}", e)))?;
 
-                    let mut store = Store::new(&engine, m.0);
+        let mut store = Store::new(&engine, m.0);
 
-                    debug!("instantiating instnace");
-                    let i = match linker.instantiate(&mut store, &m.1).map_err(|err| {
-                        Error::Others(format!("error instantiating module: {}", err))
-                    }) {
-                        Ok(i) => i,
-                        Err(err) => {
-                            tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
+        debug!("instantiating instnace");
+        let i = linker
+            .instantiate(&mut store, &m.1)
+            .map_err(|err| Error::Others(format!("error instantiating module: {}", err)))?;
 
-                    debug!("getting interupt handle");
-                    match store.interrupt_handle().map_err(|err| {
-                        Error::Others(format!("could not get interupt handle: {}", err))
-                    }) {
-                        Ok(h) => {
-                            let mut lock = interupt.write().unwrap();
-                            *lock = Some(h);
-                            drop(lock);
-                        }
-                        Err(err) => {
-                            tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
+        debug!("getting start function");
+        let f = i
+            .get_func(&mut store, "_start")
+            .ok_or(Error::InvalidArgument(
+                "module does not have a wasi start function".to_string(),
+            ))?;
 
-                    debug!("getting start function");
-                    let f = match i
-                        .get_func(&mut store, "_start")
-                        .ok_or(Error::InvalidArgument(
-                            "module does not have a wasi start function".to_string(),
-                        )) {
-                        Ok(f) => f,
-                        Err(err) => {
-                            tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
+        debug!("starting wasi instance");
 
-                    debug!("notifying main thread we are about to start");
-                    tx.send(Ok(())).unwrap();
+        let cg = oci::get_cgroup(&spec)?;
 
-                    debug!("starting wasi instance");
+        oci::setup_cgroup(cg.as_ref(), &spec)
+            .map_err(|e| Error::Others(format!("error setting up cgroups: {}", e)))?;
 
-                    // TODO: How to get exit code?
-                    // This was relatively straight forward in go, but wasi and wasmtime are totally separate things in rust.
-                    let (lock, cvar) = &*exit_code;
-                    let _ret = match f.call(&mut store, &mut [], &mut []) {
-                        Ok(_) => {
-                            debug!("exit code: {}", 0);
-                            let mut ec = lock.lock().unwrap();
-                            *ec = Some((0, Utc::now()));
-                        }
-                        Err(_) => {
-                            error!("exit code: {}", 137);
-                            let mut ec = lock.lock().unwrap();
-                            *ec = Some((137, Utc::now()));
-                        }
-                    };
+        let res = unsafe { exec::fork(Some(cg.as_ref())) }?;
+        match res {
+            exec::Context::Parent(tid, pidfd) => {
+                let mut lr = self.pidfd.lock().unwrap();
+                *lr = Some(pidfd.clone());
 
-                    cvar.notify_all();
-                })?;
+                debug!("started wasi instance with tid {}", tid);
 
-        debug!("Waiting for start notification");
-        match rx.recv().unwrap() {
-            Ok(_) => (),
-            Err(err) => {
-                debug!("error starting instance: {}", err);
                 let code = self.exit_code.clone();
 
-                let (lock, cvar) = &*code;
-                let mut ec = lock.lock().unwrap();
-                *ec = Some((139, Utc::now()));
-                cvar.notify_all();
-                return Err(err);
+                let _ = thread::spawn(move || {
+                    let (lock, cvar) = &*code;
+                    let status = match pidfd.wait() {
+                        Ok(status) => status,
+                        Err(e) => {
+                            error!("error waiting for pid {}: {}", tid, e);
+                            cvar.notify_all();
+                            return;
+                        }
+                    };
+
+                    debug!("wasi instance exited with status {}", status.status);
+                    let mut ec = lock.lock().unwrap();
+                    *ec = Some((status.status, Utc::now()));
+                    drop(lock);
+                    cvar.notify_all();
+                });
+                Ok(tid)
+            }
+            exec::Context::Child => {
+                // child process
+
+                // TODO: How to get exit code?
+                // This was relatively straight forward in go, but wasi and wasmtime are totally separate things in rust.
+                let _ret = match f.call(&mut store, &mut [], &mut []) {
+                    Ok(_) => std::process::exit(0),
+                    Err(_) => std::process::exit(137),
+                };
             }
         }
-
-        Ok(1) // TODO: PID: I wanted to use a thread ID here, but threads use a u64, the API wants a u32
     }
 
     fn kill(&self, signal: u32) -> Result<(), Error> {
@@ -277,16 +236,23 @@ impl Instance for Wasi {
             ));
         }
 
-        let interupt = self.interupt.read().unwrap();
-        let i = interupt.as_ref().ok_or(Error::FailedPrecondition(
+        let lr = self.pidfd.lock().unwrap();
+        let fd = lr.as_ref().ok_or(Error::FailedPrecondition(
             "module is not running".to_string(),
         ))?;
-
-        i.interrupt();
-        Ok(())
+        fd.kill(signal as i32)
     }
 
     fn delete(&self) -> Result<(), Error> {
+        let spec = match load_spec(self.bundle.clone()) {
+            Ok(spec) => spec,
+            Err(err) => {
+                error!("Could not load spec, skipping cgroup cleanup: {}", err);
+                return Ok(());
+            }
+        };
+        let cg = oci::get_cgroup(&spec)?;
+        cg.delete()?;
         Ok(())
     }
 
@@ -310,10 +276,10 @@ impl Instance for Wasi {
 mod wasitest {
     use std::fs::{create_dir, read_to_string, write, File};
     use std::io::prelude::*;
+    use std::sync::mpsc::channel;
     use std::time::Duration;
 
     use tempfile::tempdir;
-    use wasmtime::Config;
 
     use super::*;
 
@@ -359,7 +325,7 @@ mod wasitest {
     #[test]
     fn test_wasi() -> Result<(), Error> {
         let dir = tempdir()?;
-        create_dir(&dir.path().join("rootfs"))?;
+        create_dir(dir.path().join("rootfs"))?;
 
         let mut f = File::create(dir.path().join("rootfs/hello.wat"))?;
         f.write_all(WASI_HELLO_WAT)?;
@@ -385,7 +351,7 @@ mod wasitest {
             .as_bytes(),
         )?;
 
-        let mut cfg = InstanceConfig::new(Engine::new(Config::new().interruptable(true))?);
+        let mut cfg = InstanceConfig::new(Engine::default());
         let cfg = cfg
             .set_bundle(dir.path().to_str().unwrap().to_string())
             .set_stdout(dir.path().join("stdout").to_str().unwrap().to_string());
@@ -422,7 +388,7 @@ mod wasitest {
 impl EngineGetter for Wasi {
     type E = wasmtime::Engine;
     fn new_engine() -> Result<Engine, Error> {
-        let engine = Engine::new(EngineConfig::default().interruptable(true))?;
+        let engine = Engine::default();
         Ok(engine)
     }
 }
