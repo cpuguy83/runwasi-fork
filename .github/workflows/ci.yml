@@ -44,6 +44,15 @@ jobs:
           command: test
           args: --all --verbose
 
+  project-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: containerd/project-checks@v1.1.0
+        with:
+          working-directory: .
+          repo-access-token: ${{ secrets.GITHUB_TOKEN }}
+
   e2e:
     needs: [build]
     strategy:
