@@ -144,11 +144,11 @@ where
         })
     }
 
-    fn wait(&self, send: Sender<(u32, DateTime<Utc>)>) -> Result<()> {
+    fn wait(&self) -> Result<(u32, DateTime<Utc>)> {
         if self.instance.is_some() {
-            return self.instance.as_ref().unwrap().wait(send);
+            return self.instance.as_ref().unwrap().wait();
         }
-        self.base.as_ref().unwrap().wait(send)
+        self.base.as_ref().unwrap().wait()
     }
 }
 
@@ -986,8 +986,7 @@ where
             ..Default::default()
         });
 
-        let (tx, rx) = channel::<(u32, DateTime<Utc>)>();
-        i.wait(tx)?;
+        let rx = self.wait(i.clone());
 
         let status = i.status.clone();
 
@@ -999,7 +998,13 @@ where
         thread::Builder::new()
             .name(format!("{}-wait", req.get_id()))
             .spawn(move || {
-                let ec = rx.recv().unwrap();
+                let ec = match rx.recv().unwrap() {
+                    Ok(ec) => ec,
+                    Err(err) => {
+                        error!("failed to wait for task: {}", err);
+                        return;
+                    }
+                };
 
                 let mut s = state.write().unwrap();
                 *s = TaskStateWrapper::Exited(TaskState::<Exited> {
@@ -1008,6 +1013,7 @@ where
 
                 let (lock, cvar) = &*status;
                 let mut status = lock.lock().unwrap();
+
                 *status = Some(ec);
                 cvar.notify_all();
                 drop(status);
@@ -1108,10 +1114,7 @@ where
             status = cvar.wait(status).unwrap();
         }
 
-        let (tx, rx) = channel::<(u32, DateTime<Utc>)>();
-        i.wait(tx)?;
-
-        let code = rx.recv().unwrap();
+        let code = i.wait()?;
         debug!("wait done: {:?}", req);
 
         let mut timestamp = Timestamp::new();

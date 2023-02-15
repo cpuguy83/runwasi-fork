@@ -1,12 +1,7 @@
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-
-use libc::{SIGINT, SIGKILL, SIGTERM};
-
-use chrono::{DateTime, Utc};
-
 use super::error::Error;
+use chrono::{DateTime, Utc};
+use libc::{SIGINT, SIGKILL, SIGTERM};
+use std::sync::{Arc, Condvar, Mutex};
 
 type ExitCode = (Mutex<Option<(u32, DateTime<Utc>)>>, Condvar);
 
@@ -83,7 +78,7 @@ pub trait Instance {
     fn start(&self) -> Result<u32, Error>;
     fn kill(&self, signal: u32) -> Result<(), Error>;
     fn delete(&self) -> Result<(), Error>;
-    fn wait(&self, send: Sender<(u32, DateTime<Utc>)>) -> Result<(), Error>;
+    fn wait(&self) -> Result<(u32, DateTime<Utc>), Error>;
 }
 
 // This is used for the "pause" container with cri.
@@ -125,18 +120,14 @@ impl Instance for Nop {
         Ok(())
     }
 
-    fn wait(&self, channel: Sender<(u32, DateTime<Utc>)>) -> Result<(), Error> {
+    fn wait(&self) -> Result<(u32, DateTime<Utc>), Error> {
         let code = self.exit_code.clone();
-        thread::spawn(move || {
-            let (lock, cvar) = &*code;
-            let mut exit = lock.lock().unwrap();
-            while (*exit).is_none() {
-                exit = cvar.wait(exit).unwrap();
-            }
-            let ec = (*exit).unwrap();
-            channel.send(ec).unwrap();
-        });
-        Ok(())
+        let (lock, cvar) = &*code;
+        let mut exit = lock.lock().unwrap();
+        while (*exit).is_none() {
+            exit = cvar.wait(exit).unwrap();
+        }
+        Ok((*exit).unwrap())
     }
 }
 
@@ -144,6 +135,7 @@ impl Instance for Nop {
 mod noptests {
     use std::sync::mpsc::channel;
     use std::sync::Arc;
+    use std::thread;
     use std::time::Duration;
 
     use libc::SIGHUP;
@@ -158,12 +150,12 @@ mod noptests {
         let n = nop.clone();
 
         thread::spawn(move || {
-            n.wait(tx).unwrap();
+            tx.send(n.wait()).unwrap();
         });
 
         nop.kill(SIGKILL as u32)?;
         let ec = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(ec.0, 137);
+        assert_eq!(ec.unwrap().0, 137);
         Ok(())
     }
 
@@ -175,12 +167,12 @@ mod noptests {
         let n = nop.clone();
 
         thread::spawn(move || {
-            n.wait(tx).unwrap();
+            tx.send(n.wait()).unwrap();
         });
 
         nop.kill(SIGTERM as u32)?;
         let ec = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(ec.0, 0);
+        assert_eq!(ec.unwrap().0, 0);
         Ok(())
     }
 
@@ -192,12 +184,12 @@ mod noptests {
         let n = nop.clone();
 
         thread::spawn(move || {
-            n.wait(tx).unwrap();
+            tx.send(n.wait()).unwrap();
         });
 
         nop.kill(SIGINT as u32)?;
         let ec = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert_eq!(ec.0, 0);
+        assert_eq!(ec?.0, 0);
         Ok(())
     }
 

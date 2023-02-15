@@ -1,6 +1,5 @@
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -256,19 +255,14 @@ impl Instance for Wasi {
         Ok(())
     }
 
-    fn wait(&self, channel: Sender<(u32, DateTime<Utc>)>) -> Result<(), Error> {
+    fn wait(&self) -> Result<(u32, DateTime<Utc>), Error> {
         let code = self.exit_code.clone();
-        thread::spawn(move || {
-            let (lock, cvar) = &*code;
-            let mut exit = lock.lock().unwrap();
-            while (*exit).is_none() {
-                exit = cvar.wait(exit).unwrap();
-            }
-            let ec = (*exit).unwrap();
-            channel.send(ec).unwrap();
-        });
-
-        Ok(())
+        let (lock, cvar) = &*code;
+        let mut exit = lock.lock().unwrap();
+        while (*exit).is_none() {
+            exit = cvar.wait(exit).unwrap();
+        }
+        Ok((*exit).unwrap())
     }
 }
 
@@ -358,7 +352,7 @@ mod wasitest {
         let w = wasi.clone();
         let (tx, rx) = channel();
         thread::spawn(move || {
-            w.wait(tx).unwrap();
+            tx.send(w.wait()).unwrap();
         });
 
         let res = match rx.recv_timeout(Duration::from_secs(10)) {
@@ -371,7 +365,7 @@ mod wasitest {
                 )));
             }
         };
-        assert_eq!(res.0, 0);
+        assert_eq!(res?.0, 0);
 
         let output = read_to_string(dir.path().join("stdout"))?;
         assert_eq!(output, "hello world\n");

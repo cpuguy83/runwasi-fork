@@ -271,19 +271,14 @@ impl Instance for Wasi {
         Ok(())
     }
 
-    fn wait(&self, channel: Sender<(u32, DateTime<Utc>)>) -> Result<(), Error> {
+    fn wait(&self) -> Result<(u32, DateTime<Utc>), Error> {
         let code = self.exit_code.clone();
-        thread::spawn(move || {
-            let (lock, cvar) = &*code;
-            let mut exit = lock.lock().unwrap();
-            while (*exit).is_none() {
-                exit = cvar.wait(exit).unwrap();
-            }
-            let ec = (*exit).unwrap();
-            channel.send(ec).unwrap();
-        });
-
-        Ok(())
+        let (lock, cvar) = &*code;
+        let mut exit = lock.lock().unwrap();
+        while (*exit).is_none() {
+            exit = cvar.wait(exit).unwrap();
+        }
+        Ok((*exit).unwrap())
     }
 }
 
@@ -378,11 +373,11 @@ mod wasitest {
         let w = wasi.clone();
         let (tx, rx) = channel();
         thread::spawn(move || {
-            w.wait(tx).unwrap();
+            tx.send(w.wait()).unwrap();
         });
 
         let res = match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(res) => Ok(res),
+            Ok(res) => res,
             Err(e) => {
                 wasi.kill(SIGKILL as u32).unwrap();
                 return Err(Error::Others(format!(
