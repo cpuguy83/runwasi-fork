@@ -75,27 +75,11 @@ jobs:
         with:
           path: release/
           name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}
-      - name: linux/amd64 - upload to GitHub release
-        uses: svenstaro/upload-release-action@2.2.1
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release/linux_amd64/*
-          file_glob: true
-          asset_name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}-linux-amd64
-          overwrite: true
-          prerelease: true
-          tag: ${{ github.ref }}
-          body: Release of ${{ needs.generate.outputs.crate }} ${{ needs.generate.outputs.version }}
-      - name: linux/arm64 - upload to GitHub release
-        uses: svenstaro/upload-release-action@2.2.1
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release/linux_arm64/*
-          file_glob: true
-          asset_name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}-linux-arm64
-          overwrite: true
-          prerelease: true
-          tag: ${{ github.ref }}
-          body: Release of ${{ needs.generate.outputs.crate }} ${{ needs.generate.outputs.version }}
-
-
+      - name: Create release
+        run: |
+          gh release create ${{ github.ref }} --generate-notes --prerelease
+          for i in release/*/*; do
+            gh release upload ${{ github.ref }} $i
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
