@@ -66,8 +66,9 @@ jobs:
       - uses: actions/checkout@v2
       - name: Setup buildx
         run: docker buildx create --use
+      - uses: crazy-max/ghaction-github-runtime@v2
       - name: build binaries
-        run: docker buildx bake --set *.cache-from=type=gha --set *.cache-to=type=gha release-tars
+        run: docker buildx bake --set *.cache-from=type=gha --set *.cache-to=type=gha,mode=max release-tars
         env:
           CRATE: ${{ needs.generate.outputs.crate }}
       - name: upload binary as GitHub artifact
@@ -79,7 +80,8 @@ jobs:
         run: |
           gh release create ${{ github.ref }} --generate-notes --prerelease
           for i in release/*/*; do
-            gh release upload ${{ github.ref }} $i
+            gh release upload ${RELEASE_NAME}  --clobber $i
           done
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: ${{ needs.generate.outputs.crate }}/${{ needs.generate.outputs.version }}
