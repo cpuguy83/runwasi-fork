@@ -37,23 +37,20 @@ jobs:
       - name: "check cgroup version"
         run: "mount | grep cgroup"
       - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - name: Install rust
+        run: |
+          set -e
+          toolchain="$(grep "ARG RUST_VERSION" Dockerfile | cut -d = -f2)"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${toolchain:-stable}
       - name: Setup WasmEdge build env
+        if: ${{ contains('wasmedge', needs.generate.outputs.crate ) }}
         run: |
           curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- --version=0.11.2
           echo "LD_LIBRARY_PATH=$HOME/.wasmedge/lib" >> $GITHUB_ENV
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --all --verbose
-      - name: Run tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all --verbose --package ${{ needs.generate.outputs.crate }}
+        run: cargo build --verbose --package ${{ needs.generate.outputs.crate }}
+      - name: Test
+        run: cargo test --verbose --package ${{ needs.generate.outputs.crate }}
 
   release:
     permissions:
@@ -75,27 +72,12 @@ jobs:
         with:
           path: release/
           name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}
-      - name: linux/amd64 - upload to GitHub release
-        uses: svenstaro/upload-release-action@2.2.1
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release/linux_amd64/*
-          file_glob: true
-          asset_name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}-linux-amd64
-          overwrite: true
-          prerelease: true
-          tag: ${{ github.ref }}
-          body: Release of ${{ needs.generate.outputs.crate }} ${{ needs.generate.outputs.version }}
-      - name: linux/arm64 - upload to GitHub release
-        uses: svenstaro/upload-release-action@2.2.1
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release/linux_arm64/*
-          file_glob: true
-          asset_name: ${{ needs.generate.outputs.crate }}-${{ needs.generate.outputs.version }}-linux-arm64
-          overwrite: true
-          prerelease: true
-          tag: ${{ github.ref }}
-          body: Release of ${{ needs.generate.outputs.crate }} ${{ needs.generate.outputs.version }}
-
-
+      - name: Create release
+        run: |
+          gh release create ${{ github.ref }} --generate-notes --prerelease
+          for i in release/*/*; do
+            gh release upload ${RELEASE_NAME} $i
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: ${{ needs.generate.outputs.crate }}/${{ needs.generate.outputs.version }}
