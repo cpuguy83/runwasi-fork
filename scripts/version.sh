@@ -5,9 +5,9 @@
 
 read -r -d '' Q <<-'EOF'
 include "crates";
-.packages | filter_by_package($CRATE) | get_bins
+.packages | filter_by_package($CRATE)[0].version
 EOF
 
 set -u -e -o pipefail
 
-cargo metadata --format-version=1 --no-deps | jq -L "${BASH_SOURCE[0]%/*}" --arg CRATE "${1}" "${Q}"
+cargo metadata --format-version=1 --no-deps | jq -r -L "${BASH_SOURCE[0]%/*}" --arg CRATE "${1}" "${Q}"
